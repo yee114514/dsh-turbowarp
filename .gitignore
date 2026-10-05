@@ -1,0 +1,8 @@
+# Test and probe output, not source.
+.e2e/
+.spike/
+backups/
+scratch-stage-*.png
+*.log
+
+node_modules/
