@@ -1241,3 +1241,178 @@ export async function keepOnlyCostume (connection, request) {
   })())`, { timeoutMs: 30000 })
   return JSON.parse(raw)
 }
+
+/**
+ * Every extension the editor currently has loaded, with the blocks it provides.
+ *
+ * Reads the runtime's own registry rather than any list of ours, so what comes back
+ * is what the project can actually use right now.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @returns {Promise<any>} the loaded extensions
+ */
+export async function listExtensions (connection) {
+  const raw = await evaluate(connection, `JSON.stringify((() => {
+    const vm = window.vm
+    const runtime = vm.runtime
+    const manager = vm.extensionManager
+    const primitives = Object.keys(runtime._primitives || {})
+
+    const loadedIds = [...manager._loadedExtensions.keys()]
+    return {
+      loaded: loadedIds.map((id) => {
+        const serviceName = manager._loadedExtensions.get(id)
+        const prefix = id + '_'
+        // The category metadata names blocks WITHOUT the prefix; the running opcodes
+        // carry it. Report both so a caller never has to guess which is which.
+        const category = Array.isArray(runtime._blockInfo)
+          ? runtime._blockInfo.find((candidate) => candidate.id === id)
+          : undefined
+        return {
+          id,
+          serviceName,
+          custom: !manager.isBuiltinExtension(id),
+          url: manager.getExtensionURLs()[id] ?? null,
+          name: category ? category.name : id,
+          colors: category ? [category.color1, category.color2, category.color3] : null,
+          opcodes: primitives.filter((opcode) => opcode.startsWith(prefix)).sort(),
+          categoryOpcodes: category
+            ? category.blocks
+              .filter((entry) => typeof entry !== 'string' && entry.info && entry.info.opcode)
+              .map((entry) => entry.info.opcode)
+            : []
+        }
+      }),
+      // Built-ins are always loadable even when not loaded; this is the menu.
+      available: Object.keys(manager.builtinExtensions).sort(),
+      // A stuck worker makes every async extension wait forever, so surface it.
+      pendingWorkers: manager.pendingWorkers.filter(Boolean).length,
+      stillLoading: manager.loadingAsyncExtensions
+    }
+  })())`, { timeoutMs: 30000 })
+  return JSON.parse(raw)
+}
+
+/**
+ * Load one extension, or several, and report what each brought with it.
+ *
+ * `vm.extensionManager.loadExtensionURL` is the single entry point: it takes a
+ * built-in ID (`pen`) or a URL (a custom extension), and decides sandboxing itself
+ * via its security manager.
+ *
+ * The timeout is the important part. A URL the VM cannot actually run — a `data:` URL
+ * under the default `worker` sandbox, for instance — does NOT reject: it queues a
+ * worker that never initialises, leaving `loadingAsyncExtensions` above zero forever.
+ * A probe that did exactly that had to be killed, and the editor stayed subtly broken
+ * until it was restarted. So this refuses to wait indefinitely, and reports the stuck
+ * state rather than pretending the load succeeded.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @param {{extensions: string[], timeoutMs?: number}} request which extensions to load
+ * @returns {Promise<any>} per-extension result
+ */
+export async function loadExtensions (connection, request) {
+  const timeoutMs = Math.max(1000, Math.min(request.timeoutMs ?? 20000, 120000))
+  const requested = [...new Set(request.extensions ?? [])].filter((id) => typeof id === 'string' && id.length > 0)
+  const raw = await evaluate(connection, `(async () => {
+    const vm = window.vm
+    const manager = vm.extensionManager
+    const runtime = vm.runtime
+    const wanted = ${JSON.stringify(requested)}
+    const perExtensionMs = ${JSON.stringify(timeoutMs)}
+    const before = Object.keys(runtime._primitives || {}).length
+    const results = []
+
+    for (const idOrUrl of wanted) {
+      const wasLoaded = manager.isExtensionLoaded(idOrUrl)
+      const startedAt = Date.now()
+      let outcome = { requested: idOrUrl, wasLoaded, ok: false }
+      try {
+        // Race the load against a deadline. Nothing else can rescue a load that never
+        // settles, and leaving the caller waiting forever is worse than failing it.
+        let timer = null
+        const deadline = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('the editor did not finish loading this extension within ' + perExtensionMs + 'ms')), perExtensionMs)
+        })
+        try {
+          await Promise.race([manager.loadExtensionURL(idOrUrl), deadline])
+        } finally {
+          if (timer !== null) clearTimeout(timer)
+        }
+        outcome.ok = true
+      } catch (error) {
+        outcome.error = String((error && error.message) || error)
+      }
+      outcome.elapsedMs = Date.now() - startedAt
+
+      // A URL is not an ID: loading by URL registers the extension under the id its
+      // own getInfo() declares, and isExtensionLoaded(url) is then false. Resolve
+      // the real id before reporting, or a successful load looks like a failure and
+      // the opcode list comes back empty.
+      let id = idOrUrl
+      if (!manager.isExtensionLoaded(idOrUrl)) {
+        const byUrl = Object.entries(manager.getExtensionURLs())
+          .find(([, url]) => url === idOrUrl)
+        if (byUrl !== undefined) id = byUrl[0]
+      }
+      outcome.id = id
+      outcome.loaded = manager.isExtensionLoaded(id)
+
+      const prefix = id + '_'
+      // Prefer the ids the manager records, so this reflects what actually got
+      // registered rather than what the caller hoped for.
+      outcome.opcodes = Object.keys(runtime._primitives || {}).filter((opcode) => opcode.startsWith(prefix)).sort()
+      results.push(outcome)
+    }
+
+    return JSON.stringify({
+      results,
+      primitivesAdded: Object.keys(runtime._primitives || {}).length - before,
+      loadedIds: [...manager._loadedExtensions.keys()],
+      available: Object.keys(manager.builtinExtensions).sort(),
+      // Above zero after a failure means a worker is stranded and async extensions
+      // will never finish again for this session.
+      strandedWorkers: manager.pendingWorkers.filter(Boolean).length,
+      stillLoading: manager.loadingAsyncExtensions,
+      extensionURLs: manager.getExtensionURLs()
+    }, null, 1)
+  })()`, { awaitPromise: true, timeoutMs: timeoutMs + 30000 })
+  return JSON.parse(raw)
+}
+
+/**
+ * Report where the live project's custom extensions come from.
+ *
+ * The location is the document's TOP-LEVEL `extensionURLs`. That is what
+ * `serialize` writes (`sb3.js:740-743`) and what `deserialize` reads (`:1546`);
+ * putting it under `meta` is ignored by both. It is also worth knowing that the
+ * serializer only records an extension some block USES, so a custom extension that
+ * is loaded but unused is not saved at all.
+ *
+ * This reads state; it does not write. Persisting happens through the ordinary
+ * project-save path, which reads `extensionManager.getExtensionURLs()` itself.
+ *
+ * @param {import('./cdp.mjs').CdpConnection} connection open connection
+ * @returns {Promise<any>} what the document declares and what the manager knows
+ */
+export async function syncProjectExtensions (connection) {
+  const raw = await evaluate(connection, `JSON.stringify((() => {
+    const vm = window.vm
+    const manager = vm.extensionManager
+    const fromManager = manager.getExtensionURLs()
+    const document = JSON.parse(vm.toJSON())
+
+    return {
+      extensions: document.extensions,
+      // What the serializer will actually write on save.
+      extensionURLs: document.extensionURLs ?? {},
+      // What the manager could supply, for comparison: keys here that are absent from
+      // the document are extensions that are loaded but unused, so they will not be
+      // saved and the project will not depend on them.
+      managerExtensionURLs: fromManager,
+      loadedIds: [...manager._loadedExtensions.keys()],
+      customIds: Object.keys(fromManager)
+    }
+  })())`, { timeoutMs: 60000 })
+  return JSON.parse(raw)
+}

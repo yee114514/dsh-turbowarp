@@ -26,6 +26,13 @@ import { fileURLToPath } from 'node:url'
 
 import { DEFAULT_SPRITE_SVG, blankProject, readSb3, starterProject, writeSb3 } from './scratch/sb3.mjs'
 import { applyFragmentToProject, summarizeProject, targetXmlFromProject } from './scratch/project.mjs'
+import {
+  BUILTIN_EXTENSIONS,
+  describeExtensions,
+  extensionsUsedByProject,
+  isBuiltinExtension,
+  qualifyOpcode
+} from './scratch/extensions.mjs'
 import { SAMPLE_RATE, encodeWav, synthesizeTone } from './scratch/wav.mjs'
 import { compileScripts, randomBlockId } from './scratch/xml.mjs'
 import { fragmentToEngine } from './scratch/engine.mjs'
@@ -39,8 +46,11 @@ import {
   editSprite,
   editVariable,
   exportSb3,
+  getProjectJson,
   getTargetXml,
   keepOnlyCostume,
+  listExtensions,
+  loadExtensions,
   loadProjectBytes,
   loadProjectJson,
   observe,
@@ -52,6 +62,7 @@ import {
   setTargetState,
   stopAll,
   stripSprite,
+  syncProjectExtensions,
   waitForVm
 } from './bridge/ops.mjs'
 import { DEFAULT_PORT, attach, launchAndAttach, probeTargets, rememberAppPath, resolveAppPath } from './bridge/app.mjs'
@@ -165,6 +176,14 @@ export function apply (ctx, rowConfig = {}) {
   if (config.debug) {
     process.stderr.write(`[${name}] v${VERSION} active (port ${config.port}, appPath ${config.appPath ?? 'auto'})\n`)
   }
+
+  /**
+   * Whether any block in a project belongs to an extension.
+   * @param {any} project parsed project document
+   * @returns {boolean} true when extension blocks are present
+   */
+  const includesExtensionBlocks = (project) =>
+    extensionsUsedByProject(project).some((extension) => extension.blocks > 0)
 
   /**
    * Format a Scratch error as one readable sentence. Anything unrecognised is
@@ -684,6 +703,144 @@ export function apply (ctx, rowConfig = {}) {
   })
 
   registerTool({
+    name: 'scratch_extension',
+    mutating: true,
+    description: [
+      'Turn TurboWarp extensions on: "pen" draws lines, "music" plays notes, "text2speech" talks, and so on.',
+      'Call it with no arguments to list what is already on and what is available.',
+      'A block from an extension is not available until the extension is on — scratch_apply will write the blocks, but they will not run.',
+      'Custom extensions load by URL, the same as pasting one into the editor; the project remembers the URL so it works again later.'
+    ].join(' '),
+    parameters: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['list', 'load'], description: 'list (default) reports state; load turns extensions on.' },
+        extensions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Extension ids to load, e.g. ["pen","music"]. A built-in id, or a URL for a custom extension.'
+        },
+        timeoutMs: { type: 'number', description: 'Per-extension load deadline in ms (default 20000).' }
+      },
+      additionalProperties: false
+    },
+    async run (args, exec, sessionId) {
+      const action = args.action === 'load' ? 'load' : 'list'
+      const requested = Array.isArray(args.extensions)
+        ? args.extensions.filter((entry) => typeof entry === 'string' && entry.trim().length > 0).map((entry) => entry.trim())
+        : []
+
+      if (action === 'load' && requested.length === 0) {
+        throw new Error('nothing to load: pass extensions, e.g. {action:"load", extensions:["pen"]}')
+      }
+      // Validate before reaching for the editor: a typo should name the typo.
+      if (action === 'load') {
+        for (const entry of requested) {
+          if (isBuiltinExtension(entry)) continue
+          if (/^https?:\/\//i.test(entry) || /^data:/i.test(entry)) continue
+          const menu = BUILTIN_EXTENSIONS.map((extension) => extension.id).join(', ')
+          throw new Error(
+            `"${entry}" is not a built-in extension and is not a URL. ` +
+            `Built-in ids: ${menu}. For a custom extension pass its https URL.`
+          )
+        }
+      }
+
+      return service.use({ sessionId, mutating: action === 'load' }, async (connection) => {
+        if (action === 'list') {
+          const state = await listExtensions(connection)
+          const lines = []
+          if (state.loaded.length === 0) {
+            lines.push('extensions on: (none)')
+          } else {
+            lines.push(`extensions on (${state.loaded.length}):`)
+            for (const extension of state.loaded) {
+              const origin = extension.custom ? `custom from ${extension.url ?? '(URL unknown)'}` : 'built-in'
+              lines.push(`  ${extension.id} — ${extension.name}, ${origin}`)
+              // Category metadata names blocks WITHOUT the prefix; the running opcode
+              // carries it. Say both, because mixing them up produces blocks that
+              // write fine and never run.
+              const samples = extension.categoryOpcodes.slice(0, 4)
+                .map((opcode) => `${opcode} -> ${qualifyOpcode(extension.id, opcode)}`)
+              if (samples.length > 0) lines.push(`    opcodes: ${samples.join(', ')}`)
+            }
+          }
+          lines.push('', 'available to turn on:')
+          const on = new Set(state.loaded.map((extension) => extension.id))
+          for (const extension of BUILTIN_EXTENSIONS) {
+            if (on.has(extension.id)) continue
+            lines.push(`  ${extension.id} — ${extension.name}: ${extension.summary}`)
+          }
+          if (state.pendingWorkers > 0 || state.stillLoading > 0) {
+            lines.push('', `WARNING: ${state.pendingWorkers} extension worker(s) are stranded and ${state.stillLoading} load(s) never finished. ` +
+              'Custom extensions will not load again in this editor session; restart TurboWarp to clear it.')
+          }
+          return { text: clamp(lines.join('\n')) }
+        }
+
+        const outcome = await loadExtensions(connection, { extensions: requested, timeoutMs: args.timeoutMs })
+        const lines = []
+        for (const result of outcome.results) {
+          if (result.ok) {
+            const already = result.wasLoaded ? ' (was already on)' : ''
+            lines.push(`on: ${result.id}${already} — ${result.opcodes.length} block(s) available, ${result.elapsedMs} ms`)
+          } else {
+            lines.push(`FAILED: ${result.id} — ${result.error}`)
+          }
+        }
+        lines.push(`extensions on now: ${outcome.loadedIds.join(', ') || '(none)'}`)
+
+        // Show the opcodes for what was just turned on. Loading an extension is only
+        // half the job: the block a model has to write is `<id>_<bareName>`, and the
+        // editor's own palette shows the BARE name. Without this the model writes
+        // `clear` instead of `pen_clear`, which applies cleanly and never runs.
+        const state = await listExtensions(connection)
+        const on = new Set(state.loaded.map((extension) => extension.id))
+        for (const extension of state.loaded) {
+          if (!requested.includes(extension.id)) continue
+          const pairs = extension.categoryOpcodes.slice(0, 8)
+            .map((opcode) => `${opcode} -> ${qualifyOpcode(extension.id, opcode)}`)
+          lines.push(`  ${extension.id} opcodes: ${pairs.join(', ')}`)
+        }
+        if (state.loaded.some((extension) => !on.has(extension.id))) {
+          lines.push('  (some loaded extensions disappeared; the editor may have been restarted)')
+        }
+
+        if (outcome.strandedWorkers > 0 || outcome.stillLoading > 0) {
+          lines.push(
+            `WARNING: ${outcome.strandedWorkers} extension worker(s) are stranded and ${outcome.stillLoading} load(s) never finished. ` +
+            'A custom extension that cannot run in a sandbox (a data: URL, or a page that never replies) leaves the editor in this state, ' +
+            'and no further custom extension will load until TurboWarp is restarted.'
+          )
+        }
+
+        // Report which custom extensions the project will actually SAVE. The
+        // serializer only records an extension that some block uses, so a loaded but
+        // unused custom extension is not persisted — a difference the caller cannot
+        // see from the "on now" line, and one that decides whether the project still
+        // works on another machine.
+        const synced = await syncProjectExtensions(connection)
+        const saved = Object.keys(synced.extensionURLs)
+        if (saved.length > 0) {
+          lines.push(`the project will save these custom sources: ${saved.map((id) => `${id} = ${synced.extensionURLs[id]}`).join(', ')}`)
+        }
+        const unsaved = synced.customIds.filter((id) => !saved.includes(id))
+        if (unsaved.length > 0) {
+          lines.push(
+            `NOT SAVED with the project: ${unsaved.join(', ')} — the project remembers a custom extension only once some block uses it. ` +
+            'Write a block from it (or the project will not load it on another machine).'
+          )
+        }
+        const used = extensionsUsedByProject(synced)
+        if (used.length > 0) {
+          lines.push('the project now depends on: ' + used.map((extension) => extension.id).join(', '))
+        }
+        return { text: clamp(lines.join('\n')) }
+      })
+    }
+  })
+
+  registerTool({
     name: 'scratch_sound',
     mutating: true,
     description: [
@@ -908,6 +1065,13 @@ export function apply (ctx, rowConfig = {}) {
         const absolute = resolveProjectPath(args.path, exec)
         const { project, assets, warnings } = await readProjectFile(absolute)
         const lines = [`project: ${absolute}`, summarizeProject(project, { assetCount: assets.size })]
+        // Offline is exactly where knowing the extension dependencies matters most:
+        // a project can be read and edited here, but its extension blocks cannot run
+        // until the extension is on in an editor.
+        lines.push(...describeExtensions(project))
+        if (includesExtensionBlocks(project)) {
+          lines.push('  (extension blocks cannot run until scratch_extension turns those extensions on)')
+        }
         if (warnings.length > 0) {
           lines.push(`warnings:\n${warnings.map((warning) => `  ${warning}`).join('\n')}`)
         }
@@ -928,6 +1092,30 @@ export function apply (ctx, rowConfig = {}) {
           }
         }
         lines.push(`editing target: ${state.editingTarget?.name ?? '(none)'}`)
+
+        // Live, the truth is what the EDITOR has loaded — not what the project document
+        // claims. Report both when they disagree, because that is exactly the state
+        // where blocks are present but refuse to run.
+        try {
+          // getProjectJson already parses; JSON.parse here would throw on an object.
+          const document = await getProjectJson(connection)
+          const used = extensionsUsedByProject(document)
+          if (used.length > 0) {
+            const loaded = await listExtensions(connection)
+            const on = new Set(loaded.loaded.map((extension) => extension.id))
+            lines.push(...describeExtensions(document))
+            const off = used.filter((extension) => !on.has(extension.id))
+            if (off.length > 0) {
+              lines.push(`  NOT TURNED ON: ${off.map((extension) => extension.id).join(', ')} — these blocks will not run; call scratch_extension to load them`)
+            }
+          }
+        } catch (error) {
+          // Extension reporting is a courtesy; never let it break the read. But do not
+          // swallow the reason silently — an empty catch here hid a real bug once.
+          if (config.debug) process.stderr.write(`[${name}] extension report failed: ${error?.message ?? error}\n`)
+          lines.push(`extensions: (could not be read: ${error?.message ?? error})`)
+        }
+
         if (includeXml) {
           const wantedLive = wanted ?? state.editingTarget?.name
           if (wantedLive !== undefined) {

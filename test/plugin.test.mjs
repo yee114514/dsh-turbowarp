@@ -107,6 +107,7 @@ test('registers the full tool surface with valid definitions', () => {
   assert.deepEqual([...h.tools.keys()].sort(), [
     'scratch_apply',
     'scratch_costume',
+    'scratch_extension',
     'scratch_input',
     'scratch_inspect',
     'scratch_launch',

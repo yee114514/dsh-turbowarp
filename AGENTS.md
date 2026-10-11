@@ -29,11 +29,11 @@
 | `src/scratch/xml-parse.mjs` | 够用的 XML 解析器（含 `escapeXml`） |
 | `src/scratch/xml.mjs` | 编译器、反编译器、自定义积木展开、注释收集、孤儿清理 |
 | `src/scratch/primitives.mjs` | 原语常量表，**改动前先核对上游** |
-| `src/scratch/engine.mjs` | 线形式 ↔ 引擎形式，**双向**都要维护 |
-| `src/scratch/sb3.mjs` | `.sb3` 归档读写、`blankProject` / `starterProject` / `buildSprite` |
+| `src/scratch/extensions.mjs` | 扩展：内置清单、opcode 前缀规则、离线依赖分析 |
+| `src/scratch/engine.mjs` | 线形式 ↔ 引擎形式，**双向**都要维护 || `src/scratch/sb3.mjs` | `.sb3` 归档读写、`blankProject` / `starterProject` / `buildSprite` |
 | `src/scratch/project.mjs` | 离线项目层：读角色、拼片段、写回文档 |
 | `src/scratch/zip.mjs` / `wav.mjs` / `svg.mjs` / `keys.mjs` | 手写的小工具 |
-| `test/` | 161 项单元测试，全部离线可跑 |
+| `test/` | 182 项单元测试，全部离线可跑 |
 | `tools/e2e.mjs` | 验收测试：走真实工具面驱动真编辑器 |
 | `tools/cleanup-editor.mjs` | 把编辑器恢复到确定的基准（**会先备份**） |
 | `tools/spike*.mjs` | 探针。不是历史垃圾，是"上游到底怎么工作"的可执行证据 |
@@ -118,7 +118,13 @@ dsh --profile <p> --dump-config | Select-String turbowarp    # 确认真的装�
 | 运行节奏 | `runtime.currentStepTime` 是固定帧长（1000/30），计时块读的是**真实时钟**。必须按真实间隔推进，否则 `wait 1 seconds` 要上千步。被节流的是页面（后台窗口约 1 秒一次），所以节奏由 Node 侧控制 |
 | 截图 | 快照回调只在 `draw()` 内部发出，而 `draw()` 在渲染器不脏时直接返回。必须显式 `requestRedraw()` + `dirty = true` + `draw()` |
 | `targets[].broadcasts` | sb3 里值是**裸字符串**（`{id: name}`），而 `variables`/`lists` 是 `[name, value]` |
-| 单实例锁 | TurboWarp 有单实例锁：已在运行（没端口）时无法 attach，只能让用户关掉再拉起 |
+| 单实例锁 | TurboWarp 有单实例锁：已在运行（没端口）时无法 attach。**商店版（MSIX）无法带调试端口启动**；给便携版一个独立的 `--user-data-dir` 就能和自己的窗口并存 |
+| 扩展：opcode 前缀 | 扩展类目里 opcode 是**裸名**（`clear`、`penDown`），运行时是 `<id>_<裸名>`（`pen_clear`）。写裸名会**静默不执行**。`qualifyOpcode` 负责拼接 |
+| 扩展：`extensions` 数组 | **按用到的 opcode 推导**，不是"加载了什么"。加载了不用就不出现；离线写回必须自己维护它（`applyFragmentToProject` 两个方向都做） |
+| 扩展：自定义 URL | 存在**项目顶层** `extensionURLs`，不是 `meta`（`sb3.js:740` 写、`:1546` 读；放 `meta` 两边都忽略，静默失效）。且**只为被方块用到的扩展**写（`getExtensionURLsToSave`）——加载了不用＝不保存。`canLoadExtensionFromProject` 默认 false，打开项目不会自动加载 |
+| 扩展：data: URL 会卡死 worker | 默认 worker 沙箱下 data: URL **不 reject 也不 resolve**，留下 `pendingWorkers: 1` + `loadingAsyncExtensions` 永远 > 0，此后该会话再也加载不了自定义扩展（只能重启）。`loadExtensions` 自己带超时并报告 `strandedWorkers` |
+| 扩展：pen 状态位置 | `target.getCustomState('Scratch.pen')`（不是 `ext_pen`）。有 `penDown` / `penAttributes.diameter`，是验证"pen 真的画了"的唯一可靠信号 |
+| 扩展不能被卸载 | `vm.loadProject()` **不会**卸掉已加载的扩展。所以测试不能假设"pen 没加载过"；`cleanup-editor --reset` 会把这一点打出来 |
 
 ## 工作方式：先问，别猜
 
@@ -167,6 +173,11 @@ dsh --profile <p> --dump-config | Select-String turbowarp    # 确认真的装�
   所以别在文档或话术里承诺"上架"之类的事。
 - **不做 TurboWarp 扩展**（那种出现在"添加扩展"列表里、加载扩展 JS 的东西），
   也不改 TurboWarp 的界面。本项目是从外面通过 CDP 驱动编辑器。
+  **但插件能打开扩展**（`scratch_extension`）——那是在编辑器里加载它自己的扩展，
+  和"把自己做成一个扩展"是两件完全不同的事。
+- **扩展的硬件类**（`microbit` / `wedo2` / `ev3` / `boost` / `gdxfor` / `makeymakey`）
+  能加载、能写方块，但没接硬件所以验证不了运行效果；`videoSensing` 需要摄像头，
+  同样只验证到加载。
 - **未在 DSH 的 `desktop` surface 上验证**（只验证了 `dsh-tui` 与 `web`）。
 - **新建角色**没有走 `vm.addSprite`（它要求资产已在 storage 里，公开 API 不接受资产对象），
   而是**复制 → 清空 → 换造型**。代价是必须有一个源角色可复制——这就是

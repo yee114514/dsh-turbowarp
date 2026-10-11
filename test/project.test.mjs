@@ -219,6 +219,46 @@ test('offline apply refuses a fragment whose block ids would collide', () => {
   )
 })
 
+test('offline edit keeps the project\'s extension list honest', () => {
+  // A fragment that uses pen makes the project depend on pen. Offline nobody derives
+  // that list for us, so the writer has to.
+  const document = project()
+  document.extensions = []
+  const fragment = compileScripts(`<xml>
+    <block type="event_whenflagclicked" id="penHat" x="0" y="0">
+      <next><block type="pen_clear" id="penClear"/></next>
+    </block>
+  </xml>`)
+  const result = applyFragmentToProject(document, { target: 'Sprite1', fragment })
+  assert.deepEqual(result.declaredExtensions, ['pen'])
+  assert.ok(document.extensions.includes('pen'))
+})
+
+test('offline edit does not re-declare what is already declared', () => {
+  const document = project()
+  document.extensions = ['pen']
+  const fragment = compileScripts(`<xml>
+    <block type="event_whenflagclicked" id="penHat" x="0" y="0">
+      <next><block type="pen_clear" id="penClear"/></next>
+    </block>
+  </xml>`)
+  const result = applyFragmentToProject(document, { target: 'Sprite1', fragment })
+  assert.deepEqual(result.declaredExtensions, [], 'pen was already declared')
+  assert.equal(result.removedDeclarations, 0, 'and it is still in use, so it stays')
+  assert.ok(document.extensions.includes('pen'))
+})
+
+test('offline edit drops a declaration nothing uses any more', () => {
+  // The project declared pen; the new script does not touch it. Leaving the
+  // declaration makes the project claim a dependency it does not have.
+  const document = project()
+  document.extensions = ['pen']
+  const fragment = compileScripts('<xml><block type="event_whenflagclicked" id="plain" x="0" y="0"/></xml>')
+  const result = applyFragmentToProject(document, { target: 'Sprite1', fragment })
+  assert.equal(result.removedDeclarations, 1)
+  assert.deepEqual(document.extensions, [])
+})
+
 test('offline edit round-trips through the file format', () => {
   // Read a target out of a project, add a script to it, and read the result back:
   // this is the offline authoring loop in miniature.

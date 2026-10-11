@@ -104,6 +104,7 @@ TurboWarp.exe --remote-debugging-port=9222
 | `scratch_sprite` | 新建空角色（只留你给的造型）、复制角色、重命名、删除、选中 |
 | `scratch_costume` | 加造型，或给舞台加背景。写 SVG 或给位图 |
 | `scratch_sound` | 加声音：合成一个，或上传字节 |
+| `scratch_extension` | **打开扩展**（画笔、音乐、朗读、翻译…），或看看现在开了哪些 |
 | `scratch_variable` | 建、改、重命名、删 变量与列表（全局或角色私有） |
 | `scratch_place` | 直接摆位置、朝向、大小、显隐，不写脚本 |
 | `scratch_inspect` | 读项目：角色、造型、变量、脚本。**给 `path` 就读磁盘上的文件，不需要编辑器** |
@@ -118,6 +119,25 @@ TurboWarp.exe --remote-debugging-port=9222
 写脚本前可以先 `scratch_apply` 加 `dryRun: true`：只检查不落地。**有问题的脚本会被拒绝应用**，
 免得留下半个坏项目。
 
+### 扩展
+
+画笔、音乐、朗读、翻译这些都要先打开，方块才会真的动：
+
+```
+scratch_extension {action:'load', extensions:['pen']}     # 打开画笔
+scratch_extension {}                                      # 看看开了哪些、还能开哪些
+```
+
+内置的十二个：`pen`（画笔）、`music`（音乐）、`text2speech`（朗读）、`translate`（翻译）、
+`videoSensing`（摄像头动作）、`makeymakey`、`microbit`、`wedo2`、`ev3`、`boost`、
+`gdxfor`（这五个要接硬件）、`tw`（TurboWarp 附加）。
+
+自定义扩展传 URL 就行，和你在编辑器里粘贴一个扩展是一样的；插件会把 URL 记进项目，
+免得换台机器就打不开。
+
+一个容易踩的坑：编辑器面板上那个方块叫 `pen down`，但脚本里要写 `pen_penDown`。
+插件在打开扩展时会把对照表打出来，照着抄就不会错。
+
 ## 两种用法
 
 | | 对着 TurboWarp 用 | 直接改文件 |
@@ -127,6 +147,7 @@ TurboWarp.exe --remote-debugging-port=9222
 | 写 | `scratch_apply` | `scratch_apply {path}`（可 `outPath` 另存） |
 | 跑 / 看 | `scratch_run` / `scratch_screenshot` / `scratch_input` | 做不到——没有编辑器就没有运行时 |
 | 画造型、加声音、建变量、建角色 | 都可以 | 做不到（这些要用到运行时） |
+| 打开扩展 | `scratch_extension` | 做不到——但读项目时会告诉你它**需要**哪些扩展 |
 
 两种方式用**同一套脚本格式**，所以「读出来 → 改 → 写回去 → 打开看」是一条完整通路。
 

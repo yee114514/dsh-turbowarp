@@ -436,4 +436,86 @@ id 由编译器生成、prototype 由编译器补上、调用处的输入名从�
 （`movedBy: 25`）。光看 XML 一致是不够的——自定义积木写错时照样能写入、能读回、
 在编辑器里也长得对，只有运行起来才暴露。
 
+# 扩展
+
+## U. opcode 前缀：类目不给，得自己拼
+
+`vm.extensionManager.loadExtensionURL('pen')` 之后，`runtime._primitives` 里是
+`pen_clear` / `pen_penDown`，而 `runtime._blockInfo` 里 pen 类目的方块 opcode 是
+**不带前缀的** `clear` / `penDown`（真机探针 `tools/spike-extensions.mjs` 打出来的）。
+上游在 `_prepareBlockInfo` 之后由 `_registerExtensionPrimitives` 加上 `<id>_`。
+
+后果是**静默的**：写 `<block type="clear">` 能存进项目、`scratch_inspect` 读得回来、
+编辑器里也不报错，就是运行时什么都不发生。所以插件在加载扩展时把
+`类目名 -> 真 opcode` 对照表打印出来（`qualifyOpcode`）。
+
+## V. 项目的 `extensions` 数组是**推导**出来的
+
+实测：加载 `pen` + `music` + `text2speech` 之后，只要项目里没有对应方块，
+`vm.toJSON().extensions` 就是 `[]`；放一个 `pen_clear` 进去，它立刻变成 `["pen"]`。
+**加载本身不留痕迹。**
+
+所以离线写回 `.sb3` 时必须自己维护这个数组（`applyFragmentToProject` 两个方向都做：
+补上用得着的、删掉没人用的），否则写出来的文件会声称自己什么都不需要。
+
+## W. `data:` URL 会**永久卡死一个 worker**
+
+想用一个自包含的 data: URL 加载自定义扩展，结果**既不 reject 也不 resolve**：
+`pendingWorkers: 1`、`loadingAsyncExtensions` 一直 > 0，`allAsyncExtensionsLoaded()`
+从此永不 resolve。探针只能被杀掉，而且编辑器在那个会话里**再也加载不了自定义扩展**
+（内置的还能加载、项目还能存）——直到重启。
+
+原因是默认沙箱是 `worker`（`tw-security-manager.js` 的 `getSandboxMode` 默认返回
+`'worker'`），而 worker 起不来又没人报错。
+
+两条结论写进了实现：
+1. `loadExtensions` **自己带超时**（默认 20s），并且回报 `strandedWorkers` 让调用方看见。
+2. 用真的 https 地址。实测 `https://extensions.turbowarp.org/lab/text.js` 37ms 加载成功。
+
+顺带测到宿主（TurboWarp Desktop）**覆写**了 `canLoadExtensionFromProject` 与
+`getSandboxMode`（源码被压缩，读不出来，只能实测）：前者对这个扩展站返回 `true`，
+后者把它判为 `unsandboxed`。
+
+## X. 自定义扩展的 URL 在**顶层** `extensionURLs`，不在 `meta` 里
+
+这条我先是写错了，而且错得**很安静**。
+
+`sb3.js` 里：`serialize` 写的是**项目顶层 `obj.extensionURLs`**（L740-743），
+`deserialize` 读的也是 **`json.extensionURLs`**（L1546）。放进 `meta.extensionURLs`
+看起来更像"元数据该待的地方"——而两边都**直接忽略它**。结果是自定义扩展的 URL
+根本没被记住，项目换台机器就打不开，而本机一切正常。
+
+还有一条相关事实：`getExtensionURLsToSave(extensionIDs, runtime)`（L301-322）
+**只为被用到的扩展**写 URL。所以"加载了自定义扩展但还没写它的方块"＝项目不会记住它。
+这条现在会主动警告（`NOT SAVED with the project: …`），因为从"on now"那行完全看不出来。
+
+我还一度在工具输出里写了一句"the project records: text = ..."，但当时只是把 URL
+塞进了一个临时的文档对象、**从没写回 VM**。做法是先去核序列化器到底写不写——答案是不写。
+于是改成报告真相（保存了哪些、没保存哪些）。
+
+## Y. pen 的状态在 `target.getCustomState('Scratch.pen')`
+
+不是 `target.ext_pen`，也不是 `runtime.ext_pen`（这两个我先后猜过，都是 `null`）。
+`scratch3_pen` 用 `STATE_KEY = 'Scratch.pen'` 存在 target 的自定义状态里，
+里面有 `penDown` 和 `penAttributes.diameter`。这是验证"pen 真的画了"的可靠信号——
+比截图靠谱，白背景上的白线看不出来。
+
+## Z. 扩展无法卸载，测试基准要考虑到
+
+`vm.loadProject()` **不会**卸掉已加载的扩展：换一个完全不含 pen 的项目，
+`pen` 仍然是 loaded。所以：
+- 测试不能断言"pen 之前没被加载过"（我第一次就这么写了，结果因为探针先加载过而失败）；
+- `cleanup-editor --reset` 会把这件事实打出来（`extensionsStillLoaded`），
+  而不是假装编辑器是干净的。真正干净的基准只有重启 TurboWarp。
+
+## Z2. 一个空 `catch` 藏了一个真 bug
+
+`scratch_inspect` 里报告扩展的那段包在 `try/catch` 里，注释写着"报告是附带的，
+别让它破坏读取"——于是 `JSON.parse(getProjectJson(...))` 这个 bug（`getProjectJson`
+**已经**返回对象了）被吞掉，扩展那一段从来就没输出过，而工具照样"成功"。
+
+改成把失败原因写进输出（`extensions: (could not be read: ...)`）之后，一眼就看到
+`"[object Object]" is not valid JSON`。**静默降级和静默失败是两回事**：
+降级要说出来，不能什么都不说。
+
 

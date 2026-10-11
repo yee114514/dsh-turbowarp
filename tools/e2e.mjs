@@ -19,7 +19,7 @@ import { fileURLToPath } from 'node:url'
 import { deflateSync } from 'node:zlib'
 
 import { apply } from '../src/index.mjs'
-import { listTargets, CdpConnection } from '../src/bridge/cdp.mjs'
+import { listTargets, CdpConnection, evaluate } from '../src/bridge/cdp.mjs'
 import { getProjectJson, exportSb3, loadProjectBytes } from '../src/bridge/ops.mjs'
 import { readSb3 } from '../src/scratch/sb3.mjs'
 import { crc32 } from '../src/scratch/zip.mjs'
@@ -79,6 +79,12 @@ const argOf = (flag, fallback) => {
 }
 const keep = argv.includes('--keep')
 const port = Number(argOf('--port', process.env.TW_PORT ?? '9222'))
+
+/** Built-in extension ids, for assertions that must not depend on load history. */
+const BUILTIN_EXTENSION_IDS = [
+  'pen', 'music', 'text2speech', 'translate', 'videoSensing', 'makeymakey',
+  'microbit', 'wedo2', 'ev3', 'boost', 'gdxfor', 'tw'
+]
 
 let failures = 0
 let checks = 0
@@ -589,6 +595,91 @@ const main = async () => {
 
   const freshState = await call('scratch_inspect', {})
   check('the starter sprite is real and empty', new RegExp(`${starterName} — 0 script\\(s\\), 0 block\\(s\\), costumes: costume1`).test(freshState.text), freshState.text)
+
+  // ── extensions ───────────────────────────────────────────────────────────
+  // The whole point of an extension tool is that its blocks RUN. Loading and then
+  // declaring victory would pass even if the blocks did nothing, so this draws with
+  // the pen and checks the pen state afterwards.
+  //
+  // Nothing here may assume pen was NOT already loaded: extensions are never
+  // unloaded, so a previous run in the same editor session leaves them on. The
+  // assertions below therefore allow "(was already on)".
+  const listing = await call('scratch_extension', {})
+  console.log('--- extensions before ---\n' + listing.text.split('\n').slice(0, 6).join('\n') + '\n')
+  check('extensions can be listed', /available to turn on:/.test(listing.text), listing.text.slice(0, 300))
+  // pen may already be on, in which case it is absent from the "available" menu; what
+  // must hold either way is that the menu exists and names at least one extension
+  // that is genuinely off.
+  const offIsNamed = BUILTIN_EXTENSION_IDS.some((id) => new RegExp(`^  ${id} — `, 'm').test(listing.text))
+  if (/extensions on \\(0\\)/.test(listing.text) || !/^ {2}pen — /m.test(listing.text)) {
+    check('the menu offers at least one extension that is off', offIsNamed, listing.text.slice(0, 600))
+  } else {
+    check('pen is reported as on', /^ {2}pen — /m.test(listing.text), listing.text.slice(0, 400))
+  }
+
+  const badName = await call('scratch_extension', { action: 'load', extensions: ['notAnExtension'] })
+    .then(() => null, (error) => error.message)
+  check('a bad extension id is refused before touching the editor',
+    badName !== null && /not a built-in extension and is not a URL/.test(badName), String(badName))
+
+  const loaded = await call('scratch_extension', { action: 'load', extensions: ['pen'] })
+  console.log('--- extension load ---\n' + loaded.text + '\n')
+  check('pen is on after loading', /on: pen( \(was already on\))? — 13 block\(s\) available/.test(loaded.text), loaded.text)
+  check('the report shows the prefix rule', /clear -> pen_clear/.test(loaded.text), loaded.text)
+  check('no worker was stranded', !/WARNING/.test(loaded.text), loaded.text)
+
+  // Now actually run a pen script and look at the pen state, which is where a pen
+  // block's effect is observable: target.getCustomState('Scratch.pen').
+  await call('scratch_apply', {
+    target: starterName,
+    xml: `<xml>
+      <block type="event_whenflagclicked" id="penHat" x="40" y="40">
+        <next>
+          <block type="pen_clear" id="penClear">
+            <next>
+              <block type="pen_setPenSizeTo" id="penSize">
+                <value name="SIZE"><shadow type="math_number"><field name="NUM">9</field></shadow></value>
+                <next>
+                  <block type="pen_penDown" id="penDown">
+                    <next>
+                      <block type="motion_changexby" id="penMove">
+                        <value name="DX"><shadow type="math_number"><field name="NUM">50</field></shadow></value>
+                      </block>
+                    </next>
+                  </block>
+                </next>
+              </block>
+            </next>
+          </block>
+        </next>
+      </block>
+    </xml>`
+  })
+  await call('scratch_place', { target: starterName, x: 0, y: 0 })
+  await call('scratch_run', { seconds: 0.3, screenshot: false })
+
+  const penState = await evaluate(connection, `JSON.stringify((() => {
+    const target = window.vm.runtime.targets.find((t) => t.getName() === ${JSON.stringify(starterName)})
+    if (!target) return { error: 'no target' }
+    const pen = target.getCustomState('Scratch.pen')
+    if (!pen) return { error: 'no pen state — the block never ran' }
+    return {
+      penDown: pen.penDown,
+      diameter: pen.penAttributes && pen.penAttributes.diameter,
+      x: target.x
+    }
+  })())`, { timeoutMs: 30000 })
+  const pen = JSON.parse(penState)
+  console.log('--- pen state after running ---\n' + JSON.stringify(pen) + '\n')
+  check('the pen block actually ran', pen.error === undefined, penState)
+  check('pen down stuck', pen.penDown === true, penState)
+  check('the pen size reached the pen state', pen.diameter === 9, penState)
+  check('the sprite moved, so the pen drew a line', pen.x === 50, penState)
+
+  // The project should now report pen, because a pen block is in it.
+  const withPen = await call('scratch_inspect', { target: starterName })
+  check('inspect reports the extension and its blocks', /pen — built into TurboWarp; \d+ block\(s\)/.test(withPen.text), withPen.text.slice(0, 500))
+  check('inspect does not warn about a missing extension', !/NOT TURNED ON/.test(withPen.text), withPen.text.slice(0, 500))
 
   // ── restore ──────────────────────────────────────────────────────────────
     if (!keep) {

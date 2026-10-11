@@ -265,6 +265,77 @@ scratch_input {key:'space', isDown:false}   # 松开
 `x` `y` `w` `h` `minimized` 可给可不给，不给就自动摆在脚本旁边。
 注释是给**人**看的：写"为什么这么做"，不要复述积木本身在做什么。
 
+## 扩展（pen / music / 语音…）
+
+**扩展方块在扩展打开之前不能跑。** 写了 `pen_clear` 但没开 pen，脚本能存、能读、
+在编辑器里也长得对，但运行时什么都不发生。
+
+```
+scratch_extension {}                                     # 先看：哪些开着、哪些能开
+scratch_extension {action:'load', extensions:['pen']}    # 打开
+```
+
+内置 id：`pen` `music` `text2speech` `translate` `videoSensing` `makeymakey`
+`microbit` `wedo2` `ev3` `boost` `gdxfor` `tw`。
+
+### 最关键的一条：opcode 要自己拼前缀
+
+编辑器面板显示的是**不带前缀**的名字，真正运行的 opcode 是 `<扩展id>_<名字>`：
+
+| 面板上的文字 | 你写进 XML 的 |
+| --- | --- |
+| `erase all` | `pen_clear` |
+| `pen down` | `pen_penDown` |
+| `stamp` | `pen_stamp` |
+| `set pen size to` | `pen_setPenSizeTo` |
+
+写错的表现是**静默的**——积木存得进去、`scratch_inspect` 也读得回来，就是不动。
+最稳的做法：先 `scratch_extension {action:'load'}`，它会把每个方块的
+`类目名 -> 真 opcode` 对照表打出来，照着抄。
+
+### 画图实战
+
+```xml
+<block type="event_whenflagclicked" id="hat" x="40" y="40">
+  <next>
+    <block type="pen_clear" id="c">
+      <next>
+        <block type="pen_setPenSizeTo" id="s">
+          <value name="SIZE"><shadow type="math_number"><field name="NUM">5</field></shadow></value>
+          <next>
+            <block type="pen_penDown" id="d">
+              <next><block type="motion_movesteps" id="m">
+                <value name="STEPS"><shadow type="math_number"><field name="NUM">100</field></shadow></value>
+              </block></next>
+            </block>
+          </next>
+        </block>
+      </next>
+    </block>
+  </next>
+</block>
+```
+
+验证"真的画了"不能只看截图（白背景上的白线看不出来）——看 pen 状态：
+`target.getCustomState('Scratch.pen')` 里的 `penDown` 和 `penAttributes.diameter`。
+
+### 自定义扩展
+
+传 URL 而不是 id：
+
+```
+scratch_extension {action:'load', extensions:['https://extensions.turbowarp.org/lab/text.js']}
+```
+
+- 插件会把 URL 写进项目（顶层的 `extensionURLs`），否则换台机器这个项目就打不开了。
+  但**只有被方块用到的扩展才会被记住**：只加载、不写方块，项目不会记住它。
+  工具会明确告诉你哪些"NOT SAVED"。
+- **别用 `data:` URL**：默认 worker 沙箱跑不起来，而且它**不报错**，会永久卡住一个
+  worker，此后这个编辑器会话再也加载不了任何自定义扩展（只能重启 TurboWarp）。
+  插件有超时保护，但正常做法就是用真的 https 地址。
+- 项目引用了自定义扩展时，**打开项目不会自动加载它**（TurboWarp 的安全默认：
+  `canLoadExtensionFromProject` 返回 false），所以要自己 load 一次。
+
 ## 保存
 
 `scratch_save` 把当前项目导出成 `.sb3`。路径相对于会话工作目录；

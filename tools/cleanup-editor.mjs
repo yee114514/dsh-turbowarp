@@ -88,16 +88,36 @@ if (reset) {
     const bytes = new Uint8Array(binary.length)
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
     await window.vm.loadProject(bytes.buffer)
+
+    // Loading a project does NOT unload extensions: the VM keeps whatever was already
+    // registered, and a previous run's extensions (or a probe's) would still show as
+    // "already on". That makes a test's starting state depend on its history, so the
+    // reset has to say so out loud rather than pretend the editor is pristine.
+    const manager = window.vm.extensionManager
+    const stillLoaded = [...manager._loadedExtensions.keys()]
+
     return JSON.stringify({
       reset: true,
       targets: window.vm.runtime.targets.map((t) => ({
         name: t.getName(),
         costumes: t.sprite ? t.sprite.costumes.map((c) => c.name) : [],
         blocks: Object.keys(t.blocks._blocks).length
-      }))
+      })),
+      // These cannot be unloaded; the only way to a truly clean slate is a restart.
+      extensionsStillLoaded: stillLoaded,
+      strandedWorkers: manager.pendingWorkers.filter(Boolean).length,
+      stillLoadingExtensions: manager.loadingAsyncExtensions
     })
   })()`, { awaitPromise: true, timeoutMs: 60000 })
   console.log(summary)
+  const report = JSON.parse(summary)
+  if (report.extensionsStillLoaded.length > 0) {
+    console.error(`note: the editor still has these extensions loaded: ${report.extensionsStillLoaded.join(', ')}`)
+    console.error('      a project load does not unload extensions; restart TurboWarp for a truly clean slate')
+  }
+  if (report.strandedWorkers > 0) {
+    console.error(`warning: ${report.strandedWorkers} extension worker(s) are stranded — restart TurboWarp before trusting custom extension loads`)
+  }
   connection.close()
   process.exit(0)
 }

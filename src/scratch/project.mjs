@@ -18,6 +18,7 @@
  */
 
 import { decompileScripts } from './xml.mjs'
+import { declareExtension, extensionsUsedByProject } from './extensions.mjs'
 
 /** Raised when a project document cannot be read as asked. */
 export class ProjectError extends Error {
@@ -282,6 +283,29 @@ export const applyFragmentToProject = (project, request) => {
   }
   target.comments = comments
 
+  // Editing blocks offline changes which extensions the project depends on, and the
+  // document's own `extensions` list is what tells a reader (and the editor) that.
+  // The live serializer derives this from the blocks in use; offline, nobody else
+  // will, so a written-back file would otherwise claim to need nothing.
+  //
+  // Both directions are computed from the document as it stands NOW — after the
+  // splice — rather than from the fragment, because other targets may already depend
+  // on extensions this edit does not touch.
+  const declaredExtensions = []
+  for (const used of extensionsUsedByProject(project)) {
+    if (used.blocks === 0) continue
+    if (declareExtension(project, used.id)) declaredExtensions.push(used.id)
+  }
+  // A declaration with no blocks behind it is a stale entry that makes a project look
+  // like it needs something it does not.
+  let removedDeclarations = 0
+  const stillUsed = new Set(extensionsUsedByProject(project).filter((used) => used.blocks > 0).map((used) => used.id))
+  project.extensions = (project.extensions ?? []).filter((id) => {
+    if (stillUsed.has(id)) return true
+    removedDeclarations++
+    return false
+  })
+
   return {
     target: target.name,
     removedBlocks,
@@ -289,6 +313,8 @@ export const applyFragmentToProject = (project, request) => {
     declaredVariables,
     createdComments,
     removedComments,
+    declaredExtensions,
+    removedDeclarations,
     blocksAfter: Object.keys(blocks).length
   }
 }
